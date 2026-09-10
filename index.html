@@ -155,7 +155,8 @@ input{font:inherit;}
   background:var(--card-solid);border:1px solid var(--line);border-radius:14px;box-shadow:var(--shadow);overflow:hidden;
   display:flex;flex-direction:column;position:relative;
 }
-.page-card .img{aspect-ratio:3/4;background:#120b07;display:flex;align-items:center;justify-content:center;overflow:hidden;}
+.page-card .img{aspect-ratio:3/4;background:#120b07;display:flex;align-items:center;justify-content:center;overflow:hidden;cursor:zoom-in;}
+.page-card .img:active{opacity:.85;}
 .page-card .img img{width:100%;height:100%;object-fit:contain;transition:transform .2s;}
 .page-num{
   position:absolute;top:8px;left:8px;background:var(--gold);color:#2b1a12;
@@ -180,6 +181,21 @@ input{font:inherit;}
 .page-actions button:active{background:var(--gold-soft);color:var(--gold);}
 .page-actions button.del:active{background:var(--danger-soft);color:var(--danger);}
 .page-actions button:disabled{opacity:.3;}
+
+/* ---------- full-screen viewer ---------- */
+.viewer{position:fixed;inset:0;z-index:120;background:#000;display:flex;flex-direction:column;color:#fff;}
+.v-top,.v-bottom{display:flex;align-items:center;gap:6px;padding:10px 12px;background:rgba(0,0,0,.6);z-index:2;}
+.v-top{padding-top:calc(10px + env(safe-area-inset-top,0px));}
+.v-bottom{padding-bottom:calc(10px + var(--safe-b));justify-content:space-around;}
+.v-top .t{flex:1;min-width:0;font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.v-top .c{font-size:12px;color:#c2ad94;font-weight:700;}
+.v-btn{width:42px;height:42px;border-radius:12px;background:rgba(255,255,255,.1);font-size:18px;display:flex;align-items:center;justify-content:center;}
+.v-btn:active{background:rgba(255,255,255,.25);}
+.v-btn:disabled{opacity:.3;}
+.v-btn.tag{width:auto;padding:0 12px;font-size:13px;font-weight:800;color:var(--gold);}
+.v-stage{flex:1;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;touch-action:none;user-select:none;-webkit-user-select:none;}
+.v-stage img{max-width:100%;max-height:100%;object-fit:contain;transform-origin:center center;will-change:transform;-webkit-user-drag:none;pointer-events:none;}
+.v-hint{position:absolute;bottom:10px;left:0;right:0;text-align:center;font-size:12px;color:rgba(255,255,255,.55);pointer-events:none;}
 
 /* ---------- modal ---------- */
 .modal-bg{
@@ -306,7 +322,7 @@ input{font:inherit;}
     Tap 📷 below to photograph the document, or pick photos from "Gallery". You'll be asked which class they belong to.
   </div>
 
-  <p class="tip">Pages go into the PDF in this order. Tap the tag on a page to change its class. ◀ ▶ reorder, ↻ rotate, ✕ remove.</p>
+  <p class="tip">Tap a page to view it full screen. Pages go into the PDF in this order; tap the tag to change its class. ◀ ▶ reorder, ↻ rotate, ✕ remove.</p>
 </main>
 
 <div class="fab-bar" id="fab-doc" hidden>
@@ -317,6 +333,25 @@ input{font:inherit;}
 
 <input type="file" id="file-input" accept="image/*" multiple hidden>
 <input type="file" id="camera-input" accept="image/*" capture="environment" hidden>
+
+<div class="viewer" id="viewer" hidden>
+  <div class="v-top">
+    <button class="v-btn" id="v-close" aria-label="Close">✕</button>
+    <div class="t" id="v-title"></div>
+    <div class="c" id="v-count"></div>
+  </div>
+  <div class="v-stage" id="v-stage">
+    <img id="v-img" alt="">
+    <div class="v-hint">Swipe for next · pinch or double-tap to zoom</div>
+  </div>
+  <div class="v-bottom">
+    <button class="v-btn" id="v-prev" aria-label="Previous">◀</button>
+    <button class="v-btn" id="v-rot" aria-label="Rotate">↻</button>
+    <button class="v-btn tag" id="v-label">+ class</button>
+    <button class="v-btn" id="v-del" aria-label="Remove">🗑️</button>
+    <button class="v-btn" id="v-next" aria-label="Next">▶</button>
+  </div>
+</div>
 
 <div class="toast" id="toast"></div>
 
@@ -621,6 +656,7 @@ async function renderDoc(){
     const im=el.querySelector('img'); im.src=p.thumb;
     const rot=p.rotation||0, sideways=rot===90||rot===270;
     im.style.transform=`rotate(${rot}deg)${sideways?' scale(.75)':''}`;
+    el.querySelector('.img').onclick=()=>openViewer(i);
     el.querySelector('.page-label').textContent=lab||'+ class';
     el.querySelector('.page-label').onclick=()=>labelPage(i);
     el.querySelector('[data-a=left]').onclick=()=>movePage(i,-1);
@@ -664,6 +700,97 @@ async function deletePage(i){
   if(!ok) return;
   await del('pages',curPages[i].id); await touchDoc(); renderDoc();
 }
+
+/* ======================= Full-screen viewer ======================= */
+const V={i:-1,url:null,scale:1,tx:0,ty:0,ptrs:new Map(),startDist:0,startScale:1,startTx:0,startTy:0,lastTap:0,swipeX:null,moved:false};
+const vImg=$('v-img'), vStage=$('v-stage');
+function vApply(){ vImg.style.transform=`translate(${V.tx}px,${V.ty}px) scale(${V.scale}) rotate(${curPages[V.i]?.rotation||0}deg)`; }
+function vFit(){
+  const p=curPages[V.i]; if(!p) return;
+  const sideways=(p.rotation===90||p.rotation===270);
+  const w=vStage.clientWidth, h=vStage.clientHeight;
+  vImg.style.maxWidth=(sideways?h:w)+'px'; vImg.style.maxHeight=(sideways?w:h)+'px';
+  V.scale=1; V.tx=0; V.ty=0; vApply();
+}
+function vShow(i){
+  if(i<0||i>=curPages.length) return;
+  V.i=i; const p=curPages[i];
+  if(V.url) URL.revokeObjectURL(V.url);
+  V.url=URL.createObjectURL(p.blob);
+  vImg.src=V.url; vImg.onload=vFit;
+  $('v-title').textContent=curDoc.name;
+  $('v-count').textContent=`Page ${i+1} / ${curPages.length}`;
+  $('v-label').textContent=p.label||'+ class';
+  $('v-prev').disabled=i===0; $('v-next').disabled=i===curPages.length-1;
+  vFit();
+}
+function openViewer(i){ $('viewer').hidden=false; document.body.style.overflow='hidden'; vShow(i); }
+function closeViewer(){
+  $('viewer').hidden=true; document.body.style.overflow='';
+  if(V.url){ URL.revokeObjectURL(V.url); V.url=null; } vImg.removeAttribute('src'); V.i=-1;
+}
+$('v-close').onclick=closeViewer;
+$('v-prev').onclick=()=>vShow(V.i-1);
+$('v-next').onclick=()=>vShow(V.i+1);
+$('v-rot').onclick=async()=>{ const i=V.i; await rotatePage(i); vShow(i); };
+$('v-label').onclick=async()=>{ const i=V.i; await labelPage(i); vShow(i); };
+$('v-del').onclick=async()=>{
+  const i=V.i, n=curPages.length;
+  await deletePage(i);
+  if(curPages.length===n) return;            // cancelled
+  if(!curPages.length) closeViewer(); else vShow(Math.min(i,curPages.length-1));
+};
+window.addEventListener('resize',()=>{ if(V.i>=0) vFit(); });
+
+// gestures: pinch zoom, pan when zoomed, swipe when not, double-tap zoom
+vStage.addEventListener('pointerdown',e=>{
+  vStage.setPointerCapture(e.pointerId);
+  V.ptrs.set(e.pointerId,{x:e.clientX,y:e.clientY});
+  V.moved=false;
+  if(V.ptrs.size===1){ V.swipeX=e.clientX; V.startTx=V.tx; V.startTy=V.ty; V.px=e.clientX; V.py=e.clientY; }
+  if(V.ptrs.size===2){
+    const [a,b]=[...V.ptrs.values()];
+    V.startDist=Math.hypot(a.x-b.x,a.y-b.y); V.startScale=V.scale; V.swipeX=null;
+  }
+});
+vStage.addEventListener('pointermove',e=>{
+  if(!V.ptrs.has(e.pointerId)) return;
+  V.ptrs.set(e.pointerId,{x:e.clientX,y:e.clientY});
+  if(V.ptrs.size===2){
+    const [a,b]=[...V.ptrs.values()];
+    const d=Math.hypot(a.x-b.x,a.y-b.y);
+    V.scale=Math.min(6,Math.max(1,V.startScale*d/V.startDist)); V.moved=true; vApply();
+  }else if(V.ptrs.size===1){
+    const dx=e.clientX-V.px, dy=e.clientY-V.py;
+    if(Math.abs(dx)>4||Math.abs(dy)>4) V.moved=true;
+    if(V.scale>1){ V.tx=V.startTx+dx; V.ty=V.startTy+dy; vApply(); }
+  }
+});
+function vEnd(e){
+  if(!V.ptrs.has(e.pointerId)) return;
+  V.ptrs.delete(e.pointerId);
+  if(V.ptrs.size>0){ V.swipeX=null; return; }
+  if(V.scale<=1.02){ V.scale=1; V.tx=0; V.ty=0; vApply(); }
+  if(V.swipeX!==null && V.scale===1){
+    const dx=e.clientX-V.swipeX;
+    if(dx<-60) vShow(V.i+1); else if(dx>60) vShow(V.i-1);
+  }
+  if(!V.moved){
+    const now=Date.now();
+    if(now-V.lastTap<320){
+      if(V.scale>1){ V.scale=1; V.tx=0; V.ty=0; }
+      else{ const r=vStage.getBoundingClientRect(); V.scale=2.5; V.tx=(r.width/2-(e.clientX-r.left))*1.5; V.ty=(r.height/2-(e.clientY-r.top))*1.5; }
+      vApply(); V.lastTap=0;
+    }else V.lastTap=now;
+  }
+  V.swipeX=null;
+}
+vStage.addEventListener('pointerup',vEnd);
+vStage.addEventListener('pointercancel',vEnd);
+document.addEventListener('keydown',e=>{
+  if($('viewer').hidden) return;
+  if(e.key==='Escape') closeViewer(); else if(e.key==='ArrowRight') vShow(V.i+1); else if(e.key==='ArrowLeft') vShow(V.i-1);
+});
 
 /* ======================= Adding images ======================= */
 $('btn-add').onclick=()=>{ $('file-input').value=''; $('file-input').click(); };
