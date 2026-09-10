@@ -283,7 +283,7 @@ input{font:inherit;}
   <div class="section-title">Your files</div>
   <div class="doc-list" id="doc-list"></div>
 
-  <p class="tip">🔒 Everything stays on your phone. No photo is ever uploaded anywhere.</p>
+  <p class="tip">🔒 Everything stays on your phone. No photo is ever uploaded. Works without internet once opened.</p>
   <div class="types">
     <span>Result Cards</span><span>Roll No Slips</span><span>Certificates</span><span>B-Form</span>
     <span>Birth Certificate</span><span>CNIC</span><span>Domicile</span><span>Bills</span><span>Any paper</span>
@@ -1251,6 +1251,24 @@ $('seg-size').querySelectorAll('button').forEach(b=>b.onclick=async()=>{
 function goList(){ curDoc=null; refreshDocs().then(()=>showView('list')); }
 $('btn-back').onclick=()=>{ if(history.state && history.state.doc) history.back(); else goList(); };
 window.addEventListener('popstate',()=>{ if(!(history.state&&history.state.doc)) goList(); });
+
+/* ======================= Offline (service worker) ======================= */
+if('serviceWorker' in navigator && location.protocol.startsWith('http')){
+  window.addEventListener('load',async()=>{
+    try{
+      const reg=await navigator.serviceWorker.register('./sw.js');
+      const firstInstall=!navigator.serviceWorker.controller;
+      reg.addEventListener('updatefound',()=>{
+        const nw=reg.installing; if(!nw) return;
+        nw.addEventListener('statechange',()=>{
+          if(nw.state!=='installed') return;
+          if(firstInstall) toast('✅ Ready to work offline',3000);
+          else toast('App updated. Close and reopen to get the new version',4000);
+        });
+      });
+    }catch(e){ console.warn('sw',e); }
+  });
+}
 
 /* ======================= Boot ======================= */
 (async function(){
