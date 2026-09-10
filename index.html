@@ -197,6 +197,16 @@ input{font:inherit;}
 .v-stage img{max-width:100%;max-height:100%;object-fit:contain;transform-origin:center center;will-change:transform;-webkit-user-drag:none;pointer-events:none;}
 .v-hint{position:absolute;bottom:10px;left:0;right:0;text-align:center;font-size:12px;color:rgba(255,255,255,.55);pointer-events:none;}
 
+/* ---------- crop editor ---------- */
+.crop{position:fixed;inset:0;z-index:125;background:#000;display:flex;flex-direction:column;color:#fff;}
+.crop .c-top{padding:calc(12px + env(safe-area-inset-top,0px)) 16px 10px;background:rgba(0,0,0,.6);}
+.crop .c-top b{display:block;font-size:16px;}
+.crop .c-top small{color:#c2ad94;font-size:12px;}
+.c-stage{flex:1;position:relative;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none;}
+.c-stage canvas{position:absolute;left:0;top:0;}
+.c-bottom{display:flex;gap:8px;padding:10px 12px calc(12px + var(--safe-b));background:rgba(0,0,0,.6);}
+.c-bottom .btn{flex:1;min-width:0;padding:13px 8px;font-size:14px;}
+
 /* ---------- modal ---------- */
 .modal-bg{
   position:fixed;inset:0;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);z-index:100;
@@ -301,7 +311,7 @@ input{font:inherit;}
       <label>
         <span class="switch on" id="sw-enhance" role="switch" aria-checked="true"></span>
         <span>Improve quality
-          <small>Cleans up and sharpens screenshots and blurry photos</small>
+          <small>Auto-crops the document, evens out lighting, sharpens text</small>
         </span>
       </label>
     </div>
@@ -350,6 +360,16 @@ input{font:inherit;}
     <button class="v-btn tag" id="v-label">+ class</button>
     <button class="v-btn" id="v-del" aria-label="Remove">🗑️</button>
     <button class="v-btn" id="v-next" aria-label="Next">▶</button>
+  </div>
+</div>
+
+<div class="crop" id="crop" hidden>
+  <div class="c-top"><b>Adjust the corners</b><small>Drag the gold dots to the document's corners. The area outside is removed.</small></div>
+  <div class="c-stage" id="c-stage"><canvas id="c-canvas"></canvas></div>
+  <div class="c-bottom">
+    <button class="btn secondary" id="c-full">Keep full photo</button>
+    <button class="btn secondary" id="c-auto">Auto</button>
+    <button class="btn" id="c-ok">✓ Crop</button>
   </div>
 </div>
 
@@ -550,28 +570,308 @@ function canvasToBlob(c,type,q){
   return new Promise(res=>c.toBlob(res,type,q));
 }
 
-async function processImage(file,enhance){
-  const bmp=await loadBitmap(file);
-  let w=bmp.width,h=bmp.height;
+function finalizeCanvas(src,enhance,scan){
+  // src: ImageBitmap/Image/canvas -> {blob,thumb,width,height}
+  let w=src.width,h=src.height;
   const longest=Math.max(w,h);
   let scale=1;
   if(longest>MAX_SIDE) scale=MAX_SIDE/longest;
   else if(enhance && longest<TARGET_SIDE) scale=Math.min(2,TARGET_SIDE/longest);
   w=Math.round(w*scale); h=Math.round(h*scale);
-
-  let c=drawScaled(bmp,w,h);
-  if(bmp.close) bmp.close();
+  let c=drawScaled(src,w,h);
+  if(scan) c=flattenLighting(c);
   if(enhance) c=enhanceCanvas(c);
-
+  return c;
+}
+async function packCanvas(c){
+  const w=c.width,h=c.height;
   const blob=await canvasToBlob(c,'image/jpeg',0.93);
-
   const ts=360, tScale=ts/Math.max(w,h);
   const tc=document.createElement('canvas'); tc.width=Math.round(w*tScale); tc.height=Math.round(h*tScale);
   const tg=tc.getContext('2d'); tg.imageSmoothingQuality='high'; tg.drawImage(c,0,0,tc.width,tc.height);
   const thumb=tc.toDataURL('image/jpeg',0.8);
-
   c.width=c.height=0;
   return {blob,thumb,width:w,height:h};
+}
+async function processImage(file,enhance){
+  const bmp=await loadBitmap(file);
+  const c=finalizeCanvas(bmp,enhance,false);
+  if(bmp.close) bmp.close();
+  return packCanvas(c);
+}
+
+/* ======================= Document scanner ======================= */
+// Even out lighting so paper reads white and shadows disappear (scan look)
+function flattenLighting(c){
+  const w=c.width,h=c.height,g=c.getContext('2d');
+  const img=g.getImageData(0,0,w,h), d=img.data;
+  const f=8, sw=Math.max(1,Math.round(w/f)), sh=Math.max(1,Math.round(h/f));
+  // small luminance map (max of channels approximates paper brightness)
+  let small=new Float32Array(sw*sh);
+  for(let y=0;y<sh;y++)for(let x=0;x<sw;x++){
+    let acc=0,n=0;
+    const y0=Math.floor(y*h/sh),y1=Math.min(h,Math.floor((y+1)*h/sh)),x0=Math.floor(x*w/sw),x1=Math.min(w,Math.floor((x+1)*w/sw));
+    for(let yy=y0;yy<y1;yy+=2)for(let xx=x0;xx<x1;xx+=2){const p=(yy*w+xx)*4;acc+=Math.max(d[p],d[p+1],d[p+2]);n++;}
+    small[y*sw+x]=n?acc/n:255;
+  }
+  // grey-level "max" filter then blur: background = bright surface, ignoring text
+  // paper-white estimate: wide window so photos and coloured blocks inside the card don't count as "background"
+  const r=Math.max(3,Math.round(Math.min(sw,sh)/6));
+  const sorted=Float32Array.from(small).sort(); const paper=sorted[Math.floor(sorted.length*0.95)]||255;
+  const mx=new Float32Array(sw*sh);
+  for(let y=0;y<sh;y++)for(let x=0;x<sw;x++){
+    let m=0;
+    for(let dy=-r;dy<=r;dy++){const yy=y+dy;if(yy<0||yy>=sh)continue;for(let dx=-r;dx<=r;dx++){const xx=x+dx;if(xx<0||xx>=sw)continue;const v=small[yy*sw+xx];if(v>m)m=v;}}
+    mx[y*sw+x]=m;
+  }
+  const bl=new Float32Array(sw*sh);
+  for(let it=0;it<2;it++){
+    const src=it===0?mx:bl, dst=it===0?bl:mx;
+    for(let y=0;y<sh;y++)for(let x=0;x<sw;x++){
+      let acc=0,n=0;
+      for(let dy=-r;dy<=r;dy++){const yy=y+dy;if(yy<0||yy>=sh)continue;for(let dx=-r;dx<=r;dx++){const xx=x+dx;if(xx<0||xx>=sw)continue;acc+=src[yy*sw+xx];n++;}}
+      dst[y*sw+x]=acc/n;
+    }
+  }
+  const bg=mx;
+  // divide each pixel by local background (bilinear sample), target white ~245
+  for(let y=0;y<h;y++){
+    const fy=Math.min(sh-1,y*sh/h), y0=Math.floor(fy), y1=Math.min(sh-1,y0+1), ty=fy-y0;
+    for(let x=0;x<w;x++){
+      const fx=Math.min(sw-1,x*sw/w), x0=Math.floor(fx), x1=Math.min(sw-1,x0+1), tx=fx-x0;
+      const b=(bg[y0*sw+x0]*(1-tx)+bg[y0*sw+x1]*tx)*(1-ty)+(bg[y1*sw+x0]*(1-tx)+bg[y1*sw+x1]*tx)*ty;
+      const k=Math.min(1.6,Math.max(1,245/Math.max(paper*0.6,b,40)));
+      const p=(y*w+x)*4;
+      let v=d[p]*k; d[p]=v>255?255:v;
+      v=d[p+1]*k; d[p+1]=v>255?255:v;
+      v=d[p+2]*k; d[p+2]=v>255?255:v;
+    }
+  }
+  g.putImageData(img,0,0);
+  return c;
+}
+
+// Find the document's 4 corners in a photo. Returns [[x,y]x4] in source pixels (TL,TR,BR,BL) or null.
+function detectDocument(src){
+  const S=420, sc=S/Math.max(src.width,src.height);
+  const w=Math.max(8,Math.round(src.width*sc)), h=Math.max(8,Math.round(src.height*sc));
+  const c=document.createElement('canvas'); c.width=w; c.height=h;
+  const g=c.getContext('2d'); g.drawImage(src,0,0,w,h);
+  const d=g.getImageData(0,0,w,h).data;
+  const n=w*h;
+  // background colour = median of border band
+  const band=Math.max(2,Math.round(Math.min(w,h)*0.04));
+  const rs=[],gs=[],bs=[];
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){
+    if(y<band||y>=h-band||x<band||x>=w-band){const p=(y*w+x)*4;rs.push(d[p]);gs.push(d[p+1]);bs.push(d[p+2]);}
+  }
+  const med=a=>{a.sort((p,q)=>p-q);return a[a.length>>1];};
+  const br=med(rs),bg=med(gs),bb=med(bs);
+  // distance from background
+  const dist=new Float32Array(n); let maxD=0;
+  for(let i=0;i<n;i++){const p=i*4;const v=Math.sqrt((d[p]-br)**2+(d[p+1]-bg)**2+(d[p+2]-bb)**2);dist[i]=v;if(v>maxD)maxD=v;}
+  if(maxD<25) return null;
+  // Otsu threshold
+  const hist=new Uint32Array(256); for(let i=0;i<n;i++) hist[Math.min(255,dist[i]|0)]++;
+  let sum=0; for(let i=0;i<256;i++) sum+=i*hist[i];
+  let sumB=0,wB=0,best=0,thr=0;
+  for(let t=0;t<256;t++){wB+=hist[t];if(!wB)continue;const wF=n-wB;if(!wF)break;sumB+=t*hist[t];const mB=sumB/wB,mF=(sum-sumB)/wF;const v=wB*wF*(mB-mF)**2;if(v>best){best=v;thr=t;}}
+  // Otsu splits paper from table, but dark print on the document (headers, photos) sits in between: relax it
+  thr=Math.min(60,Math.max(22,thr*0.45));
+  let mask=new Uint8Array(n); for(let i=0;i<n;i++) mask[i]=dist[i]>thr?1:0;
+  // morphology: close then open (3x3, 2 iterations each)
+  const dil=(m)=>{const o=new Uint8Array(n);for(let y=0;y<h;y++)for(let x=0;x<w;x++){let v=0;for(let dy=-1;dy<=1&&!v;dy++){const yy=y+dy;if(yy<0||yy>=h)continue;for(let dx=-1;dx<=1;dx++){const xx=x+dx;if(xx<0||xx>=w)continue;if(m[yy*w+xx]){v=1;break;}}}o[y*w+x]=v;}return o;};
+  const ero=(m)=>{const o=new Uint8Array(n);for(let y=0;y<h;y++)for(let x=0;x<w;x++){let v=1;for(let dy=-1;dy<=1&&v;dy++){const yy=y+dy;if(yy<0||yy>=h){v=0;break;}for(let dx=-1;dx<=1;dx++){const xx=x+dx;if(xx<0||xx>=w||!m[yy*w+xx]){v=0;break;}}}o[y*w+x]=v;}return o;};
+  mask=ero(ero(dil(dil(mask)))); mask=dil(dil(ero(ero(mask))));
+  // largest connected component
+  const lab=new Int32Array(n).fill(-1); let bestArea=0,bestId=-1,id=0;
+  const stack=new Int32Array(n);
+  for(let i=0;i<n;i++){
+    if(!mask[i]||lab[i]>=0) continue;
+    let sp=0,area=0; stack[sp++]=i; lab[i]=id;
+    while(sp){const k=stack[--sp];area++;const x=k%w,y=(k/w)|0;
+      if(x>0&&mask[k-1]&&lab[k-1]<0){lab[k-1]=id;stack[sp++]=k-1;}
+      if(x<w-1&&mask[k+1]&&lab[k+1]<0){lab[k+1]=id;stack[sp++]=k+1;}
+      if(y>0&&mask[k-w]&&lab[k-w]<0){lab[k-w]=id;stack[sp++]=k-w;}
+      if(y<h-1&&mask[k+w]&&lab[k+w]<0){lab[k+w]=id;stack[sp++]=k+w;}}
+    if(area>bestArea){bestArea=area;bestId=id;} id++;
+  }
+  if(bestId<0||bestArea<n*0.12) return null;
+  // boundary points of the component -> convex hull
+  const pts=[];
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){const k=y*w+x;if(lab[k]!==bestId)continue;
+    if(x===0||y===0||x===w-1||y===h-1||lab[k-1]!==bestId||lab[k+1]!==bestId||lab[k-w]!==bestId||lab[k+w]!==bestId) pts.push([x,y]);}
+  if(pts.length<4) return null;
+  pts.sort((a,b)=>a[0]-b[0]||a[1]-b[1]);
+  const cross=(o,a,b)=>(a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0]);
+  const lower=[]; for(const p of pts){while(lower.length>=2&&cross(lower[lower.length-2],lower[lower.length-1],p)<=0)lower.pop();lower.push(p);}
+  const upper=[]; for(let i=pts.length-1;i>=0;i--){const p=pts[i];while(upper.length>=2&&cross(upper[upper.length-2],upper[upper.length-1],p)<=0)upper.pop();upper.push(p);}
+  const hull=lower.slice(0,-1).concat(upper.slice(0,-1));
+  if(hull.length<4) return null;
+  // reduce hull to 4 corners: Douglas-Peucker with growing tolerance
+  const dp=(poly,eps)=>{
+    // closed polygon: start from two farthest points
+    let a=0,b=0,md=-1;
+    for(let i=0;i<poly.length;i++)for(let j=i+1;j<poly.length;j++){const dd=(poly[i][0]-poly[j][0])**2+(poly[i][1]-poly[j][1])**2;if(dd>md){md=dd;a=i;b=j;}}
+    const seg=(arr)=>{ if(arr.length<3) return arr;
+      const p0=arr[0],p1=arr[arr.length-1]; let mi=0,mdist=-1;
+      const L=Math.hypot(p1[0]-p0[0],p1[1]-p0[1])||1;
+      for(let i=1;i<arr.length-1;i++){const q=arr[i];const dd=Math.abs((p1[0]-p0[0])*(p0[1]-q[1])-(p0[0]-q[0])*(p1[1]-p0[1]))/L;if(dd>mdist){mdist=dd;mi=i;}}
+      if(mdist>eps){const l=seg(arr.slice(0,mi+1)),r=seg(arr.slice(mi));return l.slice(0,-1).concat(r);} return [p0,p1]; };
+    const part1=poly.slice(a,b+1), part2=poly.slice(b).concat(poly.slice(0,a+1));
+    const r1=seg(part1), r2=seg(part2);
+    return r1.slice(0,-1).concat(r2.slice(0,-1));
+  };
+  let quad=null;
+  for(let eps=1;eps<60;eps*=1.4){const q=dp(hull,eps);if(q.length<=4){if(q.length===4)quad=q;break;}}
+  if(!quad){ // fallback: diagonal extremes
+    const pick=f=>hull.reduce((m,p)=>f(p)>f(m)?p:m);
+    quad=[pick(p=>-p[0]-p[1]),pick(p=>p[0]-p[1]),pick(p=>p[0]+p[1]),pick(p=>-p[0]+p[1])];
+  }
+  // order TL,TR,BR,BL
+  const cx=quad.reduce((a,p)=>a+p[0],0)/4, cy=quad.reduce((a,p)=>a+p[1],0)/4;
+  quad.sort((a,b)=>Math.atan2(a[1]-cy,a[0]-cx)-Math.atan2(b[1]-cy,b[0]-cx));
+  let tl=0,md2=Infinity; quad.forEach((p,i)=>{const dd=p[0]+p[1];if(dd<md2){md2=dd;tl=i;}});
+  quad=quad.slice(tl).concat(quad.slice(0,tl));
+  // sanity: area
+  const area=Math.abs(quad.reduce((a,p,i)=>{const q=quad[(i+1)%4];return a+p[0]*q[1]-q[0]*p[1];},0))/2;
+  if(area<n*0.12) return null;
+  return {corners:quad.map(p=>[p[0]/sc,p[1]/sc]),coverage:area/n};
+}
+
+// Homography from unit square corners -> quad, then warp with inverse mapping
+function warpDocument(src,corners){
+  // pull corners 0.6% toward the centre so no sliver of table shows at the edges
+  const cx=corners.reduce((a,p)=>a+p[0],0)/4, cy=corners.reduce((a,p)=>a+p[1],0)/4;
+  corners=corners.map(p=>[p[0]+(cx-p[0])*0.006,p[1]+(cy-p[1])*0.006]);
+  const [tl,tr,br,bl]=corners;
+  const len=(a,b)=>Math.hypot(a[0]-b[0],a[1]-b[1]);
+  let W=Math.round(Math.max(len(tl,tr),len(bl,br))), H=Math.round(Math.max(len(tl,bl),len(tr,br)));
+  const cap=MAX_SIDE; const k=Math.min(1,cap/Math.max(W,H)); W=Math.max(8,Math.round(W*k)); H=Math.max(8,Math.round(H*k));
+  // solve H mapping (u,v) in [0,W]x[0,H] to source
+  const sx=[tl[0],tr[0],br[0],bl[0]], sy=[tl[1],tr[1],br[1],bl[1]];
+  const dx=[0,W,W,0], dy=[0,0,H,H];
+  // 8 unknowns a..h: x = (a u + b v + c)/(g u + h v + 1)
+  const A=[],B=[];
+  for(let i=0;i<4;i++){
+    A.push([dx[i],dy[i],1,0,0,0,-dx[i]*sx[i],-dy[i]*sx[i]]); B.push(sx[i]);
+    A.push([0,0,0,dx[i],dy[i],1,-dx[i]*sy[i],-dy[i]*sy[i]]); B.push(sy[i]);
+  }
+  // gaussian elimination
+  const M=A.map((r,i)=>r.concat([B[i]]));
+  for(let col=0;col<8;col++){
+    let piv=col; for(let r=col+1;r<8;r++) if(Math.abs(M[r][col])>Math.abs(M[piv][col])) piv=r;
+    [M[col],M[piv]]=[M[piv],M[col]];
+    const pv=M[col][col]||1e-9;
+    for(let r=0;r<8;r++){ if(r===col) continue; const f=M[r][col]/pv; for(let cc=col;cc<9;cc++) M[r][cc]-=f*M[col][cc]; }
+  }
+  const hm=M.map((r,i)=>r[8]/(r[i]||1e-9));
+  const [a,b,c,d,e,f,g2,h2]=hm;
+  // source pixels
+  const sc=document.createElement('canvas'); sc.width=src.width; sc.height=src.height;
+  sc.getContext('2d').drawImage(src,0,0);
+  const sd=sc.getContext('2d').getImageData(0,0,sc.width,sc.height).data;
+  const sw=sc.width, sh=sc.height;
+  const out=document.createElement('canvas'); out.width=W; out.height=H;
+  const og=out.getContext('2d'); const oi=og.createImageData(W,H); const od=oi.data;
+  for(let v=0;v<H;v++){
+    for(let u=0;u<W;u++){
+      const den=g2*u+h2*v+1;
+      const x=(a*u+b*v+c)/den, y=(d*u+e*v+f)/den;
+      const x0=Math.floor(x), y0=Math.floor(y);
+      const o=(v*W+u)*4;
+      if(x0<0||y0<0||x0>=sw-1||y0>=sh-1){ const xx=Math.min(sw-1,Math.max(0,x0)), yy=Math.min(sh-1,Math.max(0,y0)); const p=(yy*sw+xx)*4; od[o]=sd[p];od[o+1]=sd[p+1];od[o+2]=sd[p+2];od[o+3]=255; continue; }
+      const tx=x-x0, ty=y-y0;
+      const p00=(y0*sw+x0)*4, p01=p00+4, p10=p00+sw*4, p11=p10+4;
+      for(let ch=0;ch<3;ch++){
+        od[o+ch]=(sd[p00+ch]*(1-tx)+sd[p01+ch]*tx)*(1-ty)+(sd[p10+ch]*(1-tx)+sd[p11+ch]*tx)*ty;
+      }
+      od[o+3]=255;
+    }
+  }
+  og.putImageData(oi,0,0);
+  sc.width=sc.height=0;
+  return out;
+}
+
+/* ======================= Crop editor ======================= */
+const CE={bmp:null,corners:null,auto:null,scale:1,ox:0,oy:0,drag:-1,resolve:null};
+const cCanvas=$('c-canvas'), cStage=$('c-stage');
+function ceLayout(){
+  const sw=cStage.clientWidth, sh=cStage.clientHeight;
+  const dpr=Math.min(2,window.devicePixelRatio||1);
+  cCanvas.width=sw*dpr; cCanvas.height=sh*dpr; cCanvas.style.width=sw+'px'; cCanvas.style.height=sh+'px';
+  const pad=28;
+  CE.scale=Math.min((sw-pad*2)/CE.bmp.width,(sh-pad*2)/CE.bmp.height);
+  CE.ox=(sw-CE.bmp.width*CE.scale)/2; CE.oy=(sh-CE.bmp.height*CE.scale)/2;
+  CE.dpr=dpr; ceDraw();
+}
+function ceDraw(){
+  const g=cCanvas.getContext('2d'); const dpr=CE.dpr;
+  g.setTransform(dpr,0,0,dpr,0,0);
+  g.fillStyle='#000'; g.fillRect(0,0,cCanvas.width,cCanvas.height);
+  g.drawImage(CE.bmp,CE.ox,CE.oy,CE.bmp.width*CE.scale,CE.bmp.height*CE.scale);
+  const P=CE.corners.map(p=>[CE.ox+p[0]*CE.scale,CE.oy+p[1]*CE.scale]);
+  // dim outside
+  g.save(); g.beginPath(); g.rect(0,0,cCanvas.width,cCanvas.height);
+  g.moveTo(P[0][0],P[0][1]); for(let i=3;i>=1;i--) g.lineTo(P[i][0],P[i][1]); g.closePath();
+  g.fillStyle='rgba(0,0,0,.55)'; g.fill('evenodd'); g.restore();
+  g.beginPath(); g.moveTo(P[0][0],P[0][1]); for(let i=1;i<4;i++) g.lineTo(P[i][0],P[i][1]); g.closePath();
+  g.lineWidth=2; g.strokeStyle='#e3a95c'; g.stroke();
+  for(const p of P){ g.beginPath(); g.arc(p[0],p[1],12,0,Math.PI*2); g.fillStyle='rgba(227,169,92,.35)'; g.fill(); g.beginPath(); g.arc(p[0],p[1],6,0,Math.PI*2); g.fillStyle='#e3a95c'; g.fill(); }
+}
+function openCropEditor(bmp,corners){
+  return new Promise(res=>{
+    CE.bmp=bmp; CE.auto=corners?corners.map(p=>p.slice()):null;
+    CE.corners=(corners||[[0,0],[bmp.width,0],[bmp.width,bmp.height],[0,bmp.height]]).map(p=>p.slice());
+    CE.resolve=res;
+    $('c-auto').hidden=!corners;
+    $('crop').hidden=false; document.body.style.overflow='hidden';
+    requestAnimationFrame(ceLayout);
+  });
+}
+function closeCropEditor(v){ $('crop').hidden=true; document.body.style.overflow=''; const r=CE.resolve; CE.resolve=null; CE.bmp=null; r&&r(v); }
+$('c-ok').onclick=()=>closeCropEditor(CE.corners.map(p=>p.slice()));
+$('c-full').onclick=()=>closeCropEditor(null);
+$('c-auto').onclick=()=>{ if(CE.auto){ CE.corners=CE.auto.map(p=>p.slice()); ceDraw(); } };
+cStage.addEventListener('pointerdown',e=>{
+  const r=cCanvas.getBoundingClientRect(); const x=e.clientX-r.left, y=e.clientY-r.top;
+  let best=-1,bd=40;
+  CE.corners.forEach((p,i)=>{const px=CE.ox+p[0]*CE.scale,py=CE.oy+p[1]*CE.scale;const dd=Math.hypot(px-x,py-y);if(dd<bd){bd=dd;best=i;}});
+  CE.drag=best; if(best>=0) cStage.setPointerCapture(e.pointerId);
+});
+cStage.addEventListener('pointermove',e=>{
+  if(CE.drag<0) return;
+  const r=cCanvas.getBoundingClientRect(); const x=e.clientX-r.left, y=e.clientY-r.top;
+  CE.corners[CE.drag]=[Math.min(CE.bmp.width,Math.max(0,(x-CE.ox)/CE.scale)),Math.min(CE.bmp.height,Math.max(0,(y-CE.oy)/CE.scale))];
+  ceDraw();
+});
+const ceUp=()=>{CE.drag=-1;};
+cStage.addEventListener('pointerup',ceUp); cStage.addEventListener('pointercancel',ceUp);
+window.addEventListener('resize',()=>{ if(!$('crop').hidden&&CE.bmp) ceLayout(); });
+
+// Full scan flow for one photo: detect -> (review) -> warp -> enhance
+async function scanImage(file,enhance,fromCamera){
+  const bmp=await loadBitmap(file);
+  let det=null;
+  try{ det=detectDocument(bmp); }catch(e){ console.error(e); }
+  const auto=det&&det.coverage<0.9?det.corners:null;
+  let corners=null;
+  if(fromCamera||auto){
+    unbusy();
+    corners=await openCropEditor(bmp,auto);
+    busy('Preparing photos…');
+  }
+  let c;
+  if(corners){
+    const warped=warpDocument(bmp,corners);
+    c=finalizeCanvas(warped,enhance,true);
+    warped.width=warped.height=0;
+  }else{
+    c=finalizeCanvas(bmp,enhance,false);
+  }
+  if(bmp.close) bmp.close();
+  return packCanvas(c);
 }
 
 /* ======================= State ======================= */
@@ -796,7 +1096,7 @@ document.addEventListener('keydown',e=>{
 $('btn-add').onclick=()=>{ $('file-input').value=''; $('file-input').click(); };
 $('btn-camera').onclick=()=>{ $('camera-input').value=''; $('camera-input').click(); };
 
-async function addFiles(fileList){
+async function addFiles(fileList,fromCamera){
   const files=[...fileList].filter(f=>f.type.startsWith('image/')||/\.(jpe?g|png|webp|heic|heif|bmp|gif)$/i.test(f.name));
   if(!files.length) return;
   const enhance=curDoc.enhance!==false;
@@ -806,7 +1106,7 @@ async function addFiles(fileList){
   busy('Preparing photos…',`0 / ${files.length}`);
   for(const f of files){
     try{
-      const r=await processImage(f,enhance);
+      const r=await scanImage(f,enhance,!!fromCamera);
       await put('pages',{id:uid(),docId:curDoc.id,order:order++,rotation:0,label,createdAt:Date.now(),...r});
       done++;
     }catch(err){ console.error(err); failed++; }
@@ -819,7 +1119,7 @@ async function addFiles(fileList){
   else toast(`${done} page${done>1?'s':''} added ✅`);
 }
 $('file-input').addEventListener('change',e=>addFiles(e.target.files));
-$('camera-input').addEventListener('change',e=>addFiles(e.target.files));
+$('camera-input').addEventListener('change',e=>addFiles(e.target.files,true));
 
 /* ======================= PDF ======================= */
 function blobToDataURL(blob){
