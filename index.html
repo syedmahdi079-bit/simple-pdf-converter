@@ -269,6 +269,7 @@ input{font:inherit;}
     <h1>Simple PDF Converter</h1>
     <div class="sub">Any document · photo to PDF · saved on your phone</div>
   </div>
+  <button class="icon-btn" id="btn-backup" aria-label="Backup and restore" title="Backup">☁️</button>
 </header>
 
 <main class="view active" id="view-list">
@@ -343,6 +344,7 @@ input{font:inherit;}
 
 <input type="file" id="file-input" accept="image/*" multiple hidden>
 <input type="file" id="camera-input" accept="image/*" capture="environment" hidden>
+<input type="file" id="restore-input" accept=".json,application/json" hidden>
 
 <div class="viewer" id="viewer" hidden>
   <div class="v-top">
@@ -437,7 +439,7 @@ function unbusy(){ $('busy').hidden=true; }
 const DOC_TYPES=['Result Cards','Roll No Slips','Certificates','B-Form','Birth Certificate','CNIC','Domicile','Bills'];
 const LABELS=['9th','10th','11th','12th','1st Year','2nd Year','Bachelors','Masters'];
 
-function modal({title,text,input,placeholder,value,chips,okText='OK',cancelText='Cancel',danger=false}){
+function modal({title,text,input,placeholder,value,chips,okText='OK',cancelText='Cancel',altText=null,danger=false}){
   return new Promise(res=>{
     $('toast').classList.remove('show');
     const bg=document.createElement('div'); bg.className='modal-bg';
@@ -447,6 +449,7 @@ function modal({title,text,input,placeholder,value,chips,okText='OK',cancelText=
       ${chips?'<div class="chips"></div>':''}
       <div class="actions">
         <button class="btn secondary" data-a="cancel"></button>
+        ${altText?'<button class="btn secondary" data-a="alt"></button>':''}
         <button class="btn ${danger?'danger':''}" data-a="ok"></button>
       </div></div>`;
     bg.querySelector('h3').textContent=title;
@@ -454,6 +457,7 @@ function modal({title,text,input,placeholder,value,chips,okText='OK',cancelText=
     if(!text) bg.querySelector('p').hidden=true;
     bg.querySelector('[data-a=cancel]').textContent=cancelText;
     bg.querySelector('[data-a=ok]').textContent=okText;
+    if(altText){ bg.querySelector('[data-a=alt]').textContent=altText; bg.querySelector('[data-a=alt]').onclick=()=>close('alt'); }
     const inp=bg.querySelector('input');
     if(inp){ inp.placeholder=placeholder||''; inp.value=value||''; }
     if(chips){
@@ -1214,6 +1218,80 @@ async function downloadPDF(){
   }
 }
 $('btn-pdf').onclick=downloadPDF;
+
+/* ======================= Backup & restore ======================= */
+function blobToBase64(blob){ return new Promise(res=>{ const r=new FileReader(); r.onload=()=>res(r.result.split(',')[1]); r.readAsDataURL(blob); }); }
+function base64ToBlob(b64,type){ const bin=atob(b64); const u=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i); return new Blob([u],{type}); }
+
+async function saveFile(blob,fname,title){
+  const hostDownloads=(window.claude && typeof window.claude.use==='function')?await window.claude.use('downloads').catch(()=>null):null;
+  if(hostDownloads){
+    try{ await hostDownloads.save({filename:fname,data:blob}); return true; }
+    catch(err){ if(err&&err.code==='declined') return false; }
+  }
+  const file=new File([blob],fname,{type:blob.type});
+  if(navigator.canShare && navigator.canShare({files:[file]})){
+    try{ await navigator.share({files:[file],title}); return true; }
+    catch(err){ if(err&&err.name==='AbortError') return false; }
+  }
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download=fname; a.rel='noopener';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),60000);
+  return true;
+}
+
+async function exportBackup(){
+  const allDocs=await getAll('docs'), allPages=await getAll('pages');
+  if(!allDocs.length){ toast('Nothing to back up yet'); return; }
+  busy('Packing your files…',`${allPages.length} page${allPages.length===1?'':'s'}`);
+  const out={app:'simple-pdf-converter',version:1,exportedAt:new Date().toISOString(),docs:[]};
+  for(const d of allDocs){
+    const pages=allPages.filter(p=>p.docId===d.id).sort((a,b)=>a.order-b.order);
+    const items=[];
+    for(const p of pages){
+      items.push({id:p.id,order:p.order,rotation:p.rotation||0,label:p.label||'',createdAt:p.createdAt,width:p.width,height:p.height,thumb:p.thumb,jpeg:await blobToBase64(p.blob)});
+    }
+    out.docs.push({id:d.id,name:d.name,createdAt:d.createdAt,updatedAt:d.updatedAt,enhance:d.enhance!==false,pageSize:d.pageSize||'a4',pages:items});
+  }
+  const blob=new Blob([JSON.stringify(out)],{type:'application/json'});
+  unbusy();
+  const day=new Date().toISOString().slice(0,10);
+  const fname=`pdf-converter-backup-${day}.json`;
+  const ok=await saveFile(blob,fname,'PDF Converter backup');
+  if(ok) toast(`Backup ready: ${(blob.size/1024/1024).toFixed(1)} MB. Save it to Google Drive or Files`,4000);
+}
+
+async function importBackup(file){
+  let data;
+  try{ data=JSON.parse(await file.text()); }catch(e){ toast('That is not a backup file'); return; }
+  if(!data||data.app!=='simple-pdf-converter'||!Array.isArray(data.docs)){ toast('That is not a backup file'); return; }
+  const existingDocs=new Set((await getAll('docs')).map(d=>d.id));
+  const existingPages=new Set((await getAll('pages')).map(p=>p.id));
+  busy('Restoring…','');
+  let nd=0,np=0;
+  for(const d of data.docs){
+    if(!existingDocs.has(d.id)){
+      await put('docs',{id:d.id,name:d.name||'Restored file',createdAt:d.createdAt||Date.now(),updatedAt:d.updatedAt||Date.now(),enhance:d.enhance!==false,pageSize:d.pageSize||'a4'});
+      nd++;
+    }
+    for(const p of (d.pages||[])){
+      if(existingPages.has(p.id)) continue;
+      await put('pages',{id:p.id,docId:d.id,order:p.order||0,rotation:p.rotation||0,label:p.label||'',createdAt:p.createdAt||Date.now(),width:p.width,height:p.height,thumb:p.thumb,blob:base64ToBlob(p.jpeg,'image/jpeg')});
+      np++;
+    }
+  }
+  unbusy();
+  await refreshDocs();
+  toast(np||nd?`Restored ${nd} file${nd===1?'':'s'}, ${np} page${np===1?'':'s'} ✅`:'Everything in that backup is already here',3500);
+}
+
+$('btn-backup').onclick=async()=>{
+  const choice=await modal({title:'Backup & restore',text:'Backup saves all your files and pages into one file. Keep it in Google Drive or Files. Restore brings them back on any phone.',okText:'☁️ Save backup',altText:'Restore',cancelText:'Close'});
+  if(choice===true) exportBackup();
+  else if(choice==='alt'){ $('restore-input').value=''; $('restore-input').click(); }
+};
+$('restore-input').addEventListener('change',e=>{ const f=e.target.files[0]; if(f) importBackup(f); });
 
 /* ======================= Doc management ======================= */
 $('btn-new').onclick=async()=>{

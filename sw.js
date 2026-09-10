@@ -1,5 +1,5 @@
 /* Simple PDF Converter service worker: makes the whole app work offline. */
-const VERSION='v2026-09-10-1';
+const VERSION='v2026-09-10-2';
 const CACHE='spc-'+VERSION;
 const ASSETS=['./','./index.html','./jspdf.umd.min.js','./bg.jpg','./icon-192.png','./icon-512.png','./manifest.webmanifest'];
 
